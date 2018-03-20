@@ -1,0 +1,7 @@
+---
+- from: https://gem.zdsys.com/gems/
+  to: /tmp/gem_zdsys
+  parallelism: 10
+  retries: 3
+  delete: false
+  skiperror: true

@@ -20,6 +20,7 @@ class Gem::Mirror::Fetcher
     modified_time = File.exist?(path) && File.stat(path).mtime.rfc822
 
     req = Net::HTTP::Get.new URI.parse(uri).path
+    req.basic_auth ENV['GEM_ZDSYS_USER'], ENV['GEM_ZDSYS_PASS']
     req.add_field 'If-Modified-Since', modified_time if modified_time
 
     retries = @opts[:retries]
