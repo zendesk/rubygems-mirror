@@ -54,6 +54,14 @@ module OrganizationAudit
   class Repo
     attr_accessor :http_client
 
+    def gemfile?
+      !!gemfile
+    end
+
+    def gemfile
+      file_list.grep(/^Gemfile$/).first
+    end
+
     def gemspec_content_of_gem
       content(gemspec_file)
     end
@@ -108,6 +116,20 @@ module OrganizationAudit
       end
 
       return true
+    end
+
+    def gem_server_type
+      info = call_api("contents/#{gemfile}")
+      c = Base64.decode64(info["content"])
+      if c.include? ARTIFACTORY_GEM_REPO and !c.include? PRIVATE_GEM_REPO
+        "artifactory"
+      elsif !c.include? ARTIFACTORY_GEM_REPO and c.include? PRIVATE_GEM_REPO
+        "private"
+      elsif c.include? ARTIFACTORY_GEM_REPO and c.include? PRIVATE_GEM_REPO
+        "mix"
+      else
+        "normal"
+      end
     end
 
     def update_gemspec
@@ -515,6 +537,77 @@ def fetch_gem_projects
   gem_projects
 end
 
+def fetch_gemfile_projects
+  org = ZENDESK_ORG
+  dump_path = "/tmp/#{org}_gemfile_repo_deps.dump"
+
+  # opts = {
+  #   token: GITHUB_TOKEN,
+  #   organization: org,
+  # }
+  # private_repos = OrganizationAudit::Repo.all(opts).sort_by(&:name).select(&:private?)
+  # projects = []
+  # while private_repos.any?
+  #   puts "Remaining: #{private_repos.size}"
+  #   repo = private_repos.shift
+  #   begin
+  #     puts "Checking #{repo.name}"
+  #   rescue Exception => e
+  #     puts "Got exceptin #{e}"
+  #     puts "Skipping"
+  #     next
+  #   end
+  #   begin
+  #     if repo.gemfile?
+  #       projects << repo
+  #       puts "Adding repo #{repo.name}"
+  #       File.open(dump_path, 'wb') { |f| f.write(Marshal.dump(projects)) }
+  #     end
+  #   rescue Exception => e
+  #     puts "Exception #{e}"
+  #     puts "Retrying #{repo.name}" unless repo.nil?
+  #     private_repos << repo unless repo.nil?
+  #     break
+  #   end
+  # end
+  # File.open(dump_path, 'wb') { |f| f.write(Marshal.dump(projects)) }
+
+  projects = Marshal.load(File.read(dump_path))
+  projects
+end
+
+def save_local(path, obj)
+  File.open(path, 'wb') { |f| f.write(Marshal.dump(obj)) }
+end
+
+def load_local(path)
+  Marshal.load(File.read(path))
+end
+
+def track_migrations_gemfile_projects
+  counter_cache_path = '/tmp/zendesk_server_type_counter.dump'
+
+  projects = fetch_gemfile_projects
+
+  # counter = {}
+  # projects.each do |project|
+  #   puts "Tracking #{project.name}"
+  #   type = project.gem_server_type
+  #   puts "gem server type: #{type}"
+  #   if counter.key? type
+  #     counter[type] << project
+  #   else
+  #     counter[type] = [project]
+  #   end
+  # end
+  # save_local(counter_cache_path, counter)
+  counter = load_local(counter_cache_path)
+
+  counter.each_pair do |k,v|
+    puts "#{k} - #{v.size} repos"
+  end
+end
+
 def auto_pr_gem_project(repo, http_client)
   repo.http_client = http_client
 
@@ -566,10 +659,31 @@ def migrate_gem_projects
   File.open("/tmp/gem_batch_#{batch}_unknown", 'w') { |f| f.write({unknown: unknown_gems}.to_json) }
 end
 
+def cross_check
+  from_specs = Set.new
+  local = Set.new
+  ver = 4.8
+  files = [ "specs.#{ver}", "prerelease_specs.#{ver}", "latest_specs.#{ver}" ]
+  files.each do |file|
+    path = "/tmp/gem_zdsys/#{file}"
+    gems = Marshal.load(File.read(path))
+    gems.each do |gem|
+      from_specs.add "#{gem[0]}-#{gem[1].version}"
+    end
+  end
+  Dir["#{GEM_DIR}/*.gem"].each do |gem_path|
+    gem_name = File.basename gem_path, '.gem'
+    local.add gem_name
+  end
+
+  diff = from_specs - local
+  puts diff.to_a
+end
+
 # Main here
 
 # mirror all gems to artifactory
-mirror_gems_to_artifactory
+# mirror_gems_to_artifactory
 
 ###########################################
 # Update projects to use artifactory
@@ -579,3 +693,6 @@ mirror_gems_to_artifactory
 # output_gem_deps
 # migrate_gem_projects
 
+# cross_check
+
+track_migrations_gemfile_projects

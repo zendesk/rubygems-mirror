@@ -52,6 +52,7 @@ class Gem::Mirror::Fetcher
       fetch resp['location'], path
     when 200
       write_file(resp, path)
+      # upload_artifactory(path)
     when 403, 404
       raise Error,"#{resp.code} on #{File.basename(path)}"
     else
@@ -72,6 +73,41 @@ class Gem::Mirror::Fetcher
     # cleanup incomplete files, rescue perm errors etc, they're being
     # raised already.
     File.delete(path) rescue nil if $!
+  end
+
+  def upload_artifactory(path)
+    name = File.basename path
+    if File.extname(path) == ".gem"
+      puts "Upload #{name}"
+    else
+      puts "Skipping #{name}"
+      return
+    end
+
+    uri = "https://zdrepo.jfrog.io/zdrepo/api/gems/gems-local/#{name}"
+    puts "Try uploading #{uri}"
+    boundary = "AaB03xZZZZZZ11322321111XSDW"
+
+    req = Net::HTTP::Put.new URI.parse(uri).path
+    req.basic_auth 'dtran', "AKCp5ZmHM1jjhkbcmrxTtL1gTcC13kFSNcaFC4eSL9TduRhxkvcBNTq5LFbqTvvojAMkaGv7V"
+    req.body_stream=File.open(path)
+    req["Content-Type"] = "multipart/form-data"
+    req.add_field('Content-Length', File.size(path))
+    req.add_field('session', boundary)
+
+    begin
+      @http.request URI(uri), req do |resp|
+        puts "Got back #{resp.code} for #{name}"
+        case resp.code.to_i
+        when 200
+          puts "DONE uploading #{name}"
+        else
+          puts "FAILED uploading #{name}"
+        end
+      end
+    rescue Exception => e
+      puts "FAILED connection while trying to upload #{name}"
+    end
   end
 
 end
