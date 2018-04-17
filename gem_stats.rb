@@ -18,12 +18,14 @@ GITHUB_TOKEN = ENV['GITHUB_TOKEN']
 ZENDESK_ORG = "zendesk"
 ZENDESK_ORG_GITHUB = "http://www.github.com/zendesk/"
 GEM_MIGRATION_BRANCH = "dtran/gem_artifactory"
+GEMFILE_MIGRATION_BRANCH = "dtran/gemfile_artifactory"
 PR_TITLE = "Artifactory migration"
-PR_BODY = "[Scripted!] Update the gem server URL\n/cc @zendesk/devex @grosser\n"
+PR_TITLE_GEMFILE = "Artifactory gemfile migration"
+-PR_BODY = "[Scripted!] Update the gem server URL\n/cc @zendesk/devex @grosser\n"
 
 GEM_DIR = "/tmp/gem_zdsys/gems"
 PRIVATE_GEM_REPO = "https://gem.zdsys.com/gems/"
-ARTIFACTORY_GEM_REPO = "https://zdrepo.jfrog.io/zdrepo/api/gems/gems-local"
+ARTIFACTORY_GEM_REPO = "https://zdrepo.jfrog.io/zdrepo/api/gems/gems-local/"
 API_KEY = ENV['ARTIFACTORY_API_KEY']
 
 PRIVATE_GEM_HOST = "gem.zdsys.com"
@@ -62,6 +64,11 @@ module OrganizationAudit
       file_list.grep(/^Gemfile$/).first
     end
 
+    def gemfile_content
+      info = call_api("contents/#{gemfile}")
+      Base64.decode64(info["content"])
+    end
+
     def gemspec_content_of_gem
       content(gemspec_file)
     end
@@ -85,6 +92,7 @@ module OrganizationAudit
       rescue OpenURI::HTTPError => e
         puts "Error #{e}"
         if e.message =~ /404 Not Found/
+          puts "Seems that branch is not there... Try creating one #{branch}"
           created = false
         else
           return false
@@ -121,6 +129,19 @@ module OrganizationAudit
     def gem_server_type
       info = call_api("contents/#{gemfile}")
       c = Base64.decode64(info["content"])
+      if c.include? ARTIFACTORY_GEM_REPO and !c.include? PRIVATE_GEM_REPO
+        "artifactory"
+      elsif !c.include? ARTIFACTORY_GEM_REPO and c.include? PRIVATE_GEM_REPO
+        "private"
+      elsif c.include? ARTIFACTORY_GEM_REPO and c.include? PRIVATE_GEM_REPO
+        "mix"
+      else
+        "normal"
+      end
+    end
+
+    def gemspec_server_type
+      c = gemspec_content_of_gem
       if c.include? ARTIFACTORY_GEM_REPO and !c.include? PRIVATE_GEM_REPO
         "artifactory"
       elsif !c.include? ARTIFACTORY_GEM_REPO and c.include? PRIVATE_GEM_REPO
@@ -170,6 +191,45 @@ module OrganizationAudit
         return nil
     end
 
+    def update_gemfile
+        puts "Updating gemfile of #{name}"
+        info = call_api("contents/#{gemfile}?ref=#{GEMFILE_MIGRATION_BRANCH}")
+        c = Base64.decode64(info["content"])
+        if c.include? ARTIFACTORY_GEM_REPO and !c.include? PRIVATE_GEM_REPO
+          puts "Already updated #{gemspec_file}. Skipping...."
+          return
+        end
+
+        c.gsub!(PRIVATE_GEM_REPO, ARTIFACTORY_GEM_REPO)
+        uri = URI.parse File.join(api_url, "contents/#{gemfile}")
+        request = Net::HTTP::Put.new uri.path
+        request.body = {
+          message: "Update gemfile to use artifactory",
+          content: Base64.encode64(c),
+          sha: info["sha"],
+          branch: GEMFILE_MIGRATION_BRANCH,
+        }.to_json
+        request.add_field "Content-Type", "application/json"
+        request.add_field "Authorization", "token #{GITHUB_TOKEN}"
+
+        begin
+          http_client.request URI(uri), request do |response|
+            case response
+            when Net::HTTPSuccess then
+              puts "Seems to be ok..."
+              return response
+            else
+              puts "Failed to update #{gemfile}"
+              puts response
+            end
+          end
+        rescue Exception => e
+          puts "Error connecting to #{uri.to_s}: #{e.message}"
+        end
+
+        return nil
+    end
+
     def submit_pr
       pulls = call_api("/pulls")
       pending = pulls.select { |p| p["title"].include? PR_TITLE }
@@ -197,6 +257,44 @@ module OrganizationAudit
             return response
           else
             puts "Failed to create PR #{gemspec_file}"
+            puts response
+          end
+        end
+      rescue Exception => e
+        puts "Error connecting to #{uri.to_s}: #{e.message}"
+      end
+    end
+
+    def submit_pr_gemfile
+      puts "Submitting PR to update gemfile of #{name}"
+      pulls = call_api("/pulls")
+      pending = pulls.select { |p| p["title"].include? PR_TITLE_GEMFILE }
+      if pending.any? or (gemfile_content.include? ARTIFACTORY_GEM_REPO and !gemfile_content.include? PRIVATE_GEM_REPO)
+        puts "#{name} seems to be migrated. Skipping..."
+        return
+      end
+      puts "????"
+      puts pulls
+
+      uri = URI.parse File.join(api_url, "pulls")
+      request = Net::HTTP::Post.new uri.path
+      request.body = {
+        title: PR_TITLE_GEMFILE,
+        head: GEMFILE_MIGRATION_BRANCH,
+        base: "master",
+        body: PR_BODY,
+      }.to_json
+      request.add_field "Content-Type", "application/json"
+      request.add_field "Authorization", "token #{GITHUB_TOKEN}"
+
+      begin
+        http_client.request URI(uri), request do |response|
+          case response
+          when Net::HTTPSuccess then
+            puts "PR seems to be ok..."
+            return response
+          else
+            puts "Failed to create PR #{gemfile}"
             puts response
           end
         end
@@ -510,7 +608,8 @@ def fetch_gem_projects
   # }
   # private_repos = OrganizationAudit::Repo.all(opts).sort_by(&:name).select(&:private?)
   # gem_projects = []
-  # while private_repos
+  # while private_repos.any?
+  #   puts "Remaining: #{private_repos.size}"
   #   repo = private_repos.shift
   #   begin
   #     puts "Checking #{repo.name}"
@@ -573,6 +672,7 @@ def fetch_gemfile_projects
   # File.open(dump_path, 'wb') { |f| f.write(Marshal.dump(projects)) }
 
   projects = Marshal.load(File.read(dump_path))
+
   projects
 end
 
@@ -584,7 +684,7 @@ def load_local(path)
   Marshal.load(File.read(path))
 end
 
-def track_migrations_gemfile_projects
+def count_migration_gemfile_projects
   counter_cache_path = '/tmp/zendesk_server_type_counter.dump'
 
   projects = fetch_gemfile_projects
@@ -601,11 +701,64 @@ def track_migrations_gemfile_projects
   #   end
   # end
   # save_local(counter_cache_path, counter)
+
+  counter = load_local(counter_cache_path)
+
+  counter
+end
+
+def track_migrations_gemfile_projects
+  puts "MIGRATION TRACKING FOR RUBY PROJECTS (GEMFILES)"
+  puts
+
+  counter = count_migration_gemfile_projects
+
+  counter.each_pair do |k,v|
+    next unless k != "normal"
+    # puts "#{k} - #{v.size} repos"
+    puts "#{k}"
+    x = v.map do |item| item.url end
+    puts x
+    puts
+    puts
+  end
+  puts
+  puts
+end
+
+def track_migrations_gem_projects
+  puts "MIGRATION TRACKING FOR GEM PROJECTS (GEMSPECS)"
+  puts
+  counter_cache_path = '/tmp/zendesk_server_type_counter_gem_projects.dump'
+
+  projects = fetch_gem_projects
+
+  # counter = {}
+  # projects.each do |project|
+  #   puts "Tracking #{project.name}"
+  #   type = project.gemspec_server_type
+  #   puts "gem server type: #{type}"
+  #   if counter.key? type
+  #     counter[type] << project
+  #   else
+  #     counter[type] = [project]
+  #   end
+  # end
+  # save_local(counter_cache_path, counter)
+
   counter = load_local(counter_cache_path)
 
   counter.each_pair do |k,v|
-    puts "#{k} - #{v.size} repos"
+    next unless k != "normal"
+    # puts "#{k} - #{v.size} repos"
+    puts "Status: #{k}"
+    x = v.map do |item| item.url end
+    puts x
+    puts
+    puts
   end
+  puts
+  puts
 end
 
 def auto_pr_gem_project(repo, http_client)
@@ -659,6 +812,39 @@ def migrate_gem_projects
   File.open("/tmp/gem_batch_#{batch}_unknown", 'w') { |f| f.write({unknown: unknown_gems}.to_json) }
 end
 
+def auto_pr_gemfile_project(repo, http_client)
+  repo.http_client = http_client
+
+  gemfile = repo.gemfile_content
+  if gemfile.include? PRIVATE_GEM_REPO
+    ok = repo.create_a_branch(GEMFILE_MIGRATION_BRANCH)
+    puts "OK #{ok}"
+    if ok
+      repo.update_gemfile
+      repo.submit_pr_gemfile
+    else
+      puts "Failed to check/add pr for this #{repo.name}"
+    end
+  end
+end
+
+def migrate_ruby_projects
+  http_client = Net::HTTP::Persistent.new("repo_bot", :ENV)
+
+  counter = count_migration_gemfile_projects
+
+  repos = counter.inject([]) do |acc, (k ,v)|
+    acc.concat v unless k != "private" && k != "mix"
+    acc
+  end
+  puts repos.length
+
+  repos.each do |repo|
+    auto_pr_gemfile_project(repo, http_client)
+    break
+  end
+end
+
 def cross_check
   from_specs = Set.new
   local = Set.new
@@ -692,7 +878,9 @@ end
 # migrate gems projects to artifactory
 # output_gem_deps
 # migrate_gem_projects
+migrate_ruby_projects
 
 # cross_check
 
-track_migrations_gemfile_projects
+# track_migrations_gemfile_projects
+# track_migrations_gem_projects
